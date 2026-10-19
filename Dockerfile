@@ -80,9 +80,16 @@ RUN RTK_VERSION="${RTK_VERSION}" TARGETARCH="${TARGETARCH}" \
 # 9.15.0, not the 9.16.0 that PyPI calls latest: 9.16.0 does not resolve
 # against this image's Python 3.13 and uv silently settles on 9.15.0 when left
 # unpinned. Pinning the resolved version is what makes that visible.
+#
+# Where uv lives depends on the base image: it was on PATH up to v0.21.x, and
+# from v0.22.x it is only shipped under /opt/hermes/tools/uv-<version>-<os>/uv.
+# Look on PATH first, then in that directory, and fail with a clear message
+# rather than "uv: command not found" if a later base image moves it again.
 ARG HERMES_EXTRA_PYTHON_PACKAGES="ddgs==9.15.0"
 RUN if [ -n "${HERMES_EXTRA_PYTHON_PACKAGES}" ]; then \
-      uv pip install --python /opt/hermes/.venv --no-cache ${HERMES_EXTRA_PYTHON_PACKAGES}; \
+      UV="$(command -v uv || ls /opt/hermes/tools/uv-*/uv 2>/dev/null | head -n1)"; \
+      [ -n "${UV}" ] || { echo "uv not found on PATH or under /opt/hermes/tools" >&2; exit 1; }; \
+      "${UV}" pip install --python /opt/hermes/.venv --no-cache ${HERMES_EXTRA_PYTHON_PACKAGES}; \
     fi
 
 # ── Attack surface ───────────────────────────────────────────
