@@ -7,7 +7,9 @@
 #   1. rtk (github.com/rtk-ai/rtk) -- pinned, checksum-verified -- plus PATH
 #      shims that route selected commands through it, because Hermes has no
 #      PreToolUse hook to rewrite commands the way Claude Code does.
-#   2. The agent's extra Python packages, version-pinned.
+#   2. The agent's extra packages, version-pinned: libopus0 from the Debian
+#      suite, plus the Python packages in the agent's virtualenv -- the voice
+#      pair faster-whisper and edge-tts among them.
 #   3. Build-time attack-surface reduction: setuid/setgid bits stripped.
 #
 # What is deliberately NOT here: capabilities, no-new-privileges, pids limits,
@@ -19,8 +21,8 @@
 # Which upstream image to build on, and at which tag.
 #
 # `latest` by default: a push to main builds on upstream's latest and publishes
-# ours as `latest`. A release build passes the git tag instead, so `v2026.8.31`
-# of this image is built from `nousresearch/hermes-agent:v2026.8.31` and the
+# ours as `latest`. A release build passes the git tag instead, so `v0.22.5`
+# of this image is built from `nousresearch/hermes-agent:v0.22.5` and the
 # two tags name the same upstream release. Nothing here has to be edited for
 # that -- CI derives the tag from the ref it was triggered on.
 #
@@ -57,7 +59,7 @@ USER root
 SHELL ["/bin/bash", "-o", "pipefail", "-c"]
 
 # ── rtk ──────────────────────────────────────────────────────
-ARG RTK_VERSION=0.46.0
+ARG RTK_VERSION=1.0.1
 # Set by buildx; install-rtk.sh falls back to dpkg when building without it.
 ARG TARGETARCH
 
@@ -65,6 +67,17 @@ COPY --chmod=0755 scripts/install-rtk.sh /tmp/install-rtk.sh
 RUN RTK_VERSION="${RTK_VERSION}" TARGETARCH="${TARGETARCH}" \
       /tmp/install-rtk.sh \
     && rm -f /tmp/install-rtk.sh
+
+# ── Extra system packages ────────────────────────────────────
+# libopus0, the Opus codec library the agent's voice path loads to encode and
+# decode audio. Absent from the base image as of v0.22.5, and nothing below
+# pulls it in either -- every wheel in the Python stack bundles its own copies
+# of the libraries it needs -- so it is installed explicitly rather than left
+# to arrive as someone's side effect. Versioning comes from the suite: the
+# base is Debian 13 (trixie), which ships exactly one libopus.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends libopus0 \
+    && rm -rf /var/lib/apt/lists/*
 
 # ── Extra Python packages ────────────────────────────────────
 # Installed into the agent's own virtualenv. That venv's bin/ is already ahead
@@ -77,15 +90,24 @@ RUN RTK_VERSION="${RTK_VERSION}" TARGETARCH="${TARGETARCH}" \
 # rebuilt image is an unreviewed code change reaching an agent that has a
 # shell. Bump it on purpose.
 #
-# 9.15.0, not the 9.16.0 that PyPI calls latest: 9.16.0 does not resolve
-# against this image's Python 3.13 and uv silently settles on 9.15.0 when left
-# unpinned. Pinning the resolved version is what makes that visible.
+# 9.15.0 was picked when the base ran Python 3.13, where 9.16.0 did not
+# resolve. Since v0.22.x the base is on Python 3.14 and 9.16.0 resolves too;
+# moving to it is a deliberate bump, not something to let drift in.
+#
+# The voice pair exists for the agent's speech loop: faster-whisper turns
+# audio into text through CTranslate2 (no system ffmpeg needed -- PyAV bundles
+# the decode libraries), and edge-tts turns text back into speech through
+# Microsoft Edge's online service. Both were resolved against the venv's
+# Python 3.14 before pinning: every wheel in their trees, `av` and
+# `onnxruntime` included, has a build that satisfies it.
 #
 # Where uv lives depends on the base image: it was on PATH up to v0.21.x, and
-# from v0.22.x it is only shipped under /opt/hermes/tools/uv-<version>-<os>/uv.
-# Look on PATH first, then in that directory, and fail with a clear message
-# rather than "uv: command not found" if a later base image moves it again.
-ARG HERMES_EXTRA_PYTHON_PACKAGES="ddgs==9.15.0"
+# from v0.22.x it is only shipped under /opt/hermes/tools/uv-<version>-<os>/uv
+# (checked on v0.22.2 and v0.23.1). Look on PATH first, then in that directory,
+# and fail with a clear message rather than "uv: command not found" if a later
+# base image moves it again. This fork uses the base's own uv instead of
+# bind-mounting a third-party image from ghcr.io (upstream's approach).
+ARG HERMES_EXTRA_PYTHON_PACKAGES="ddgs==9.15.0 edge-tts==7.3.1 faster-whisper==1.2.1 av==18.1.0"
 RUN if [ -n "${HERMES_EXTRA_PYTHON_PACKAGES}" ]; then \
       UV="$(command -v uv || ls /opt/hermes/tools/uv-*/uv 2>/dev/null | head -n1)"; \
       [ -n "${UV}" ] || { echo "uv not found on PATH or under /opt/hermes/tools" >&2; exit 1; }; \
@@ -113,6 +135,10 @@ COPY --chmod=0755 scripts/healthcheck.sh /opt/rtk/bin/healthcheck.sh
 
 # start-period is generous because a cold start pulls model config, migrates
 # the session store and brings up s6 services before anything listens.
+#
+# Mirrored as a compose-level healthcheck in compose.yaml, which overrides
+# this one when the stack runs under Compose and survives the OCI image
+# format's lack of a healthcheck field -- keep the two in sync.
 HEALTHCHECK --interval=30s --timeout=6s --start-period=180s --retries=3 \
     CMD ["/opt/rtk/bin/healthcheck.sh"]
 
